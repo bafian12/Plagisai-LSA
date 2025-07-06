@@ -1,0 +1,252 @@
+import os
+import re
+import mysql.connector
+from flask import Flask, render_template, request
+from docx import Document
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import Normalizer
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from io import BytesIO
+
+app = Flask(__name__)
+db_config = {
+    'host': 'localhost',  # Ganti dengan host database kamu
+    'user': 'root',  # Ganti dengan username MySQL kamu
+    'password': '',  # Ganti dengan password MySQL kamu
+    'database': 'dokumen_plagiasi'  # Nama database yang kamu gunakan
+}
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB
+
+def extract_text_from_docx_file(file_stream):
+    doc = Document(file_stream)
+    return "\n".join([para.text for para in doc.paragraphs])
+
+def extract_text_from_docx_path(path):
+    doc = Document(path)
+    return "\n".join([para.text for para in doc.paragraphs])
+
+def load_dataset_from_db():
+    documents = []
+    filenames = []
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT filename, file_content FROM files")
+        rows = cursor.fetchall()
+
+        # Log untuk verifikasi data yang diambil
+        print(f"Data yang diambil dari database: {len(rows)} record ditemukan.")
+        
+        if not rows:  # Jika tidak ada data
+            raise Exception("Dataset tidak ditemukan di database.")
+
+        for filename, file_blob in rows:
+            try:
+                if file_blob:
+                    docx_file = BytesIO(file_blob)
+                    text = extract_text_from_docx_file(docx_file)
+                    documents.append(text)
+                    filenames.append(filename)
+            except Exception as e:
+                print(f"Gagal memproses file {filename}: {e}")
+
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Database error: {e}")
+        raise  # Pastikan error ditampilkan dengan jelas
+
+    return documents, filenames
+
+def split_sentences(text):
+    return re.split(r'(?<=[.!?]) +', text)
+
+def split_words(text):
+    return re.findall(r'\b\w+\b', text.lower())
+
+def find_matching_segments_with_svd(input_text, source_text, threshold=0.75, n_components=100):
+    input_sentences = split_sentences(input_text)
+    source_sentences = split_sentences(source_text)
+    
+    valid_input_sentences = [(i, sent) for i, sent in enumerate(input_sentences) 
+                             if len(sent.strip()) >= 10 and len(split_words(sent)) >= 3]
+    valid_source_sentences = [sent for sent in source_sentences if len(sent.strip()) >= 10]
+    
+    if not valid_input_sentences or not valid_source_sentences:
+        return [], 0
+    
+    matching_segments = []
+    total_matching_words = 0
+    
+    all_sentences = [sent for _, sent in valid_input_sentences] + valid_source_sentences
+    
+    try:
+        vectorizer = TfidfVectorizer(max_features=5000, stop_words='english')
+        tfidf_matrix = vectorizer.fit_transform(all_sentences)
+        
+        n_components = min(n_components, tfidf_matrix.shape[1], tfidf_matrix.shape[0])
+        svd = TruncatedSVD(n_components=n_components, random_state=42)
+        lsa_matrix = svd.fit_transform(tfidf_matrix)
+        
+        normalizer = Normalizer(copy=False)
+        lsa_matrix = normalizer.fit_transform(lsa_matrix)
+        
+        n_input = len(valid_input_sentences)
+        input_matrix = lsa_matrix[:n_input]
+        source_matrix = lsa_matrix[n_input:]
+        
+        similarity_matrix = cosine_similarity(input_matrix, source_matrix)
+        
+        for i, (orig_idx, input_sentence) in enumerate(valid_input_sentences):
+            input_words = split_words(input_sentence)
+            max_similarity = 0
+            best_match_idx = -1
+            
+            for j in range(len(valid_source_sentences)):
+                if similarity_matrix[i][j] > max_similarity:
+                    max_similarity = similarity_matrix[i][j]
+                    best_match_idx = j
+            
+            if max_similarity > threshold and best_match_idx >= 0:
+                source_sentence = valid_source_sentences[best_match_idx]
+                source_words = split_words(source_sentence)
+                matching_words = len(set(input_words) & set(source_words))
+                
+                if matching_words > 0:
+                    matching_segments.append({
+                        'text': input_sentence,
+                        'words': len(input_words),
+                        'matching_words': matching_words,
+                        'similarity': max_similarity
+                    })
+                    total_matching_words += matching_words
+                    
+    except Exception as e:
+        print(f"Error in SVD processing: {e}")
+        return find_matching_segments(input_text, source_text, threshold) # type: ignore
+    
+    return matching_segments, total_matching_words
+
+def calculate_source_similarity_with_svd(input_text, source_text, source_filename, n_components=100):
+    matching_segments, total_matching_words = find_matching_segments_with_svd(
+        input_text, source_text, n_components=n_components
+    )
+    
+    if not matching_segments:
+        return {
+            'filename': source_filename,
+            'similarity_percentage': 0,
+            'matching_words': 0,
+            'segments': []
+        }
+    
+    total_input_words = len(split_words(input_text))
+    similarity_percentage = (total_matching_words / total_input_words) * 100 if total_input_words > 0 else 0
+    
+    return {
+        'filename': source_filename,
+        'similarity_percentage': round(similarity_percentage, 1),
+        'matching_words': total_matching_words,
+        'segments': matching_segments
+    }
+
+def get_overall_similarity_with_svd(input_text, dataset_texts, dataset_files, n_components=100):
+    source_similarities = []
+    total_plagiarized_words = 0
+    total_input_words = len(split_words(input_text))
+    
+    batch_size = 10  # Proses 10 dokumen sekaligus
+    
+    for i in range(0, len(dataset_texts), batch_size):
+        batch_texts = dataset_texts[i:i+batch_size]
+        batch_files = dataset_files[i:i+batch_size]
+        
+        for source_text, filename in zip(batch_texts, batch_files):
+            source_sim = calculate_source_similarity_with_svd(
+                input_text, source_text, filename, n_components
+            )
+            if source_sim['similarity_percentage'] > 0:
+                source_similarities.append(source_sim)
+                total_plagiarized_words += source_sim['matching_words']
+    
+    source_similarities.sort(key=lambda x: x['similarity_percentage'], reverse=True)
+    
+    overall_similarity = (total_plagiarized_words / total_input_words) * 100 if total_input_words > 0 else 0
+    
+    source_similarities = source_similarities[:10]
+    
+    return round(overall_similarity, 0), source_similarities
+
+def highlight_plagiarized_text(input_text, all_sources_data):
+    highlighted_text = input_text
+    colors = ['#ff6b6b', '#4ecdc4', '#45b7d1', '#96ceb4', '#feca57', '#ff9ff3', '#54a0ff', '#5f27cd', '#00d2d3', '#ff9f43']
+    
+    for i, source_data in enumerate(all_sources_data):
+        color = colors[i % len(colors)]
+        for segment in source_data['segments']:
+            highlighted_text = highlighted_text.replace(
+                segment['text'], 
+                f'<mark style="background-color: {color}; opacity: 0.7;" title="Source: {source_data["filename"]} ({segment["matching_words"]} words)">{segment["text"]}</mark>'
+            )
+    
+    return highlighted_text
+
+@app.route("/", methods=["GET", "POST"])
+def index():
+    input_text = ""
+    highlighted_text = ""
+    error_message = ""
+    similarity_index = 0
+    primary_sources = []
+    use_svd = True  # Flag untuk menggunakan SVD atau tidak
+    
+    if request.method == "POST":
+        try:
+            file = request.files["file"]
+            if file and file.filename.endswith(".docx"):
+                input_text = extract_text_from_docx_file(file)
+                
+                if not input_text.strip():
+                    error_message = "❌ Dokumen kosong atau tidak dapat dibaca"
+                    return render_template("index.html", input_text=input_text, error=error_message)
+
+                dataset_texts, dataset_files = load_dataset_from_db()
+                
+                if not dataset_texts:
+                    error_message = "❌ Dataset tidak ditemukan"
+                    return render_template("index.html", input_text=input_text, error=error_message)
+
+                if use_svd and len(dataset_texts) > 5:
+                    print("Using SVD method for better performance...")
+                    similarity_index, primary_sources = get_overall_similarity_with_svd(
+                        input_text, dataset_texts, dataset_files, n_components=100
+                    )
+                else:
+                    print("Using original method...")
+                    similarity_index, primary_sources = get_overall_similarity_with_svd(
+                        input_text, dataset_texts, dataset_files
+                    )
+                
+                highlighted_text = highlight_plagiarized_text(input_text, primary_sources)
+                
+            else:
+                error_message = "❌ Silakan upload file .docx"
+
+        except Exception as e:
+            error_message = f"❌ Terjadi kesalahan: {str(e)}"
+            print(f"Error details: {e}")
+
+    return render_template(
+        "index.html",
+        input_text=input_text,
+        error=error_message,
+        highlighted=highlighted_text,
+        similarity_index=similarity_index,
+        primary_sources=primary_sources
+    )
+
+if __name__ == "__main__":
+    app.run(debug=True)
